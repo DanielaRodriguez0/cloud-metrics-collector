@@ -1,0 +1,44 @@
+version: '3.8'
+
+services:
+
+  elasticsearch06:
+    image: docker.elastic.co/elasticsearch/elasticsearch:7.17.18
+    container_name: elasticsearch06
+    environment:
+      node.name: elasticsearch06
+      ES_JAVA_OPTS: -Xms2g -Xmx2g
+      ELASTIC_PASSWORD: Changeme123
+      discovery.type: single-node
+    ports:
+      - 9200:9200
+    ulimits:
+      memlock:
+        soft: -1
+        hard: -1
+    volumes:
+      - ./elasticsearch06/elasticsearch.yml:/usr/share/elasticsearch/config/elasticsearch.yml:ro
+      - elasticsearch_data02:/usr/share/elasticsearch/data
+    networks:
+      - elk
+
+  
+  grafanacloudwatch06:
+    image: grafana/grafana:latest
+    container_name: grafanacloudwatch06
+    restart: unless-stopped
+    ports:
+      - '3002:3000'
+    volumes:
+      - grafana-store:/var/lib/grafana
+    networks:
+      - elk
+  
+volumes:
+  grafana-store:
+  elasticsearch_data02:
+    driver: local
+
+networks:
+  elk:
+    driver: bridge
