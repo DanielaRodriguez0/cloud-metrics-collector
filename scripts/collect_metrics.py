@@ -12,12 +12,10 @@ from botocore.exceptions import ClientError
 from pydantic import ValidationError
 from datetime import datetime, timedelta, timezone
 from models.account_info import AccountModel
-from elasticsearch import Elasticsearch
+from elasticsearch import Elasticsearch, helpers
 from zoneinfo import ZoneInfo
 from config.settings import settings
 from concurrent.futures import ThreadPoolExecutor, as_completed
-# import pyarrow as pa
-# import pyarrow.parquet as pq
 from datetime import datetime
 import json
 import os
@@ -497,11 +495,11 @@ def fetch_metrics_for_interval(
     cloudwatch_client: boto3.client,
     metrics: List,
     account: AccountModel,
-    interval: TimeIntervalModel,
-    es: Elasticsearch,
+    interval: TimeIntervalModel
 ):
     logger.debug(f'Fetching metrics for interval {interval}')
     consolidated_metrics = []
+    es_documents_dict = []
 
     for metric in metrics:
         response = get_metrics_data(cloudwatch_client, metric, interval)
@@ -532,8 +530,8 @@ def fetch_metrics_for_interval(
                 datapoint["Timestamp"] = timestamp_utc.isoformat()
 
                 document = create_document(response, datapoint, account.account_id)
-
-                try:
+                es_documents_dict.append(document)
+                """ try:
                     es.index(
                         index=f"metrics-test-aws-{account.account_id}", document=document
                     )
@@ -542,9 +540,9 @@ def fetch_metrics_for_interval(
                     logger.error(
                         f"Error processing data. No se pudo cargar account {account.account_id}: Namespace {metric['Namespace']} - metric {metric['MetricName']}"
                     )
-                    logger.error(error)
+                    logger.error(error) """
 
-    return consolidated_metrics
+    return consolidated_metrics, es_documents_dict
 
 
 def calculate_time_interval(
@@ -798,6 +796,7 @@ def collect_metrics(
 ) -> None:
 
     all_consolidated_metrics = []
+    all_es_documents = []
     """ for account in accounts:
         account_s3 = '838477461307'
         account_session = assume_role(account_s3, org_session)
@@ -825,7 +824,7 @@ def collect_metrics(
             intervals = split_time_range(
                 start_date, end_date, account.metrics_collection_period
             )
-            logger.debug(f"Intervals generated: {len(intervals)}")
+            logger.debug(f"Total intervals to process: {len(intervals)}")
 
             metrics = get_all_cloudwatch_metrics(cloudwatch_client)
             logger.debug(f"Found {len(metrics)} metrics")
@@ -837,16 +836,20 @@ def collect_metrics(
                         cloudwatch_client,
                         metrics,
                         account,
-                        interval,
-                        es_client
+                        interval
                     )
                     for interval in intervals
                 ]
 
                 for future in as_completed(futures):
                     try:
-                        consolidated_metrics = future.result()
+                        consolidated_metrics, es_documents = future.result()
                         all_consolidated_metrics.extend(consolidated_metrics)
+                    
+                        if es_documents and len(es_documents) > 0:
+                            all_es_documents.extend(es_documents)
+                        else:
+                            logger.info(f"No ES documents found for account {account_id} in this interval")
                     #TODO: Add exception handling   
                     except Exception as e:
                         logger.error(f"Error processing an interval for account {account_id}: {e}")
@@ -860,6 +863,33 @@ def collect_metrics(
 
                 except AwsClientErrorException as error:
                     logger.error(error)
+
+            index_name = f"metrics-testing-{account_id}"
+            #if all_es_documents and len(all_es_documents) > 0:
+
+            actions = [
+                {
+                    "_op_type": "create",
+                    "_index": index_name,
+                    "_source": document
+                }
+                for document in all_es_documents
+            ]
+
+            try:
+                success, failed = helpers.bulk(es_client, actions, raise_on_error=False)
+
+                print(f"Documentos indexados con éxito: {success}")
+                print(f"Documentos que fallaron al indexar: {len(failed)}")
+
+                # Imprimir los errores de los documentos que fallaron
+                for error in failed:
+                    print(f"Error: {error}")
+            except Exception as e:
+                print(f"Error al indexar documentos: {e}")
+                #logger.info(f"Saved {len(all_es_documents)} documents for account {account_id}")
+                #except Exception as e:
+                #    logger.error(f"Error saving documents to ES: {e}")
 
         except PeriodException as error:
             logger.error(error)
