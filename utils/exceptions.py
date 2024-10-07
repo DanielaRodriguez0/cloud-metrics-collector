@@ -66,6 +66,19 @@ class PeriodException(Exception):
 
 
 
+class AwsExpiredTokenException(Exception):
+    """ Exception raised for errors when the session token expired. """
+    def __init__(self, message: str):
+        """
+        Initializes the AwsExpiredTokenException.
+
+        Arguments:
+            message: The error message from the AWS session.
+        """
+        self.general_message = "Expired Token"
+        super().__init__(f"{self.general_message}: {message}")
+
+
 class AwsCollectMetricsException(Exception):
     """ Exception raised for errors in collecting cloudwatch metrics. """
     def __init__(self, message: str):
