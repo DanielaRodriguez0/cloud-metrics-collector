@@ -4,7 +4,8 @@ import boto3
 import time
 import argparse
 import polars as pl
-import pandas as pd
+#import pandas as pd
+import tempfile
 import sys
 import traceback
 from typing import List, Optional
@@ -18,11 +19,14 @@ from config.settings import settings
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 import json
+import collections
+import threading
 import os
 import logging
 from logging_config import setup_logger
 from models.time_interval import TimeIntervalModel
 from utils.exceptions import (
+    AwsExpiredTokenException,
     DateValidationException,
     ElasticSearchClientException,
     FileLoadException,
@@ -491,58 +495,242 @@ def get_all_cloudwatch_metrics(cloudwatch_client: boto3.client) -> List:
         raise AwsCollectMetricsException(exception_info)
 
 
-def fetch_metrics_for_interval(
+def process_interval(
+    organization_session: boto3.Session,
     cloudwatch_client: boto3.client,
+    es_client: Elasticsearch,
     metrics: List,
     account: AccountModel,
     interval: TimeIntervalModel
 ):
-    logger.debug(f'Fetching metrics for interval {interval}')
+    logger.debug(f'Starting to fetch metrics for interval {interval}')
+    no_datapoints_counter = collections.defaultdict(int)
+    counter_lock = threading.Lock()
+    total_no_datapoints = 0
+    
     consolidated_metrics = []
-    es_documents_dict = []
+    consolidate_es_documents = []
+    try:
+        for metric in metrics:
+            
+            response = get_metrics_data(cloudwatch_client, metric, interval)
+            
+                
+            if not response:
+                logger.warning(
+                    f"No response found for namespace {metric['Namespace']} and metric '{metric['MetricName']}' in account {account.account_id}"
+                )
 
-    for metric in metrics:
-        response = get_metrics_data(cloudwatch_client, metric, interval)
+            response["Dimensions"] = metric.get("Dimensions", [])
+            response["Namespace"] = metric["Namespace"][4:]
+            response["Project"] = account.project_name
+            response["Environment"] = account.project_environment
 
-        response["Dimensions"] = metric.get("Dimensions", [])
-        response["Namespace"] = metric["Namespace"][4:]
-        response["Project"] = account.project_name
-        response["Environment"] = account.project_environment
+            consolidated_metrics.append(response)
 
-        consolidated_metrics.append(response)
+            datapoints = response.get("Datapoints", [])
 
-        datapoints = response.get("Datapoints", [])
+            if not datapoints or len(datapoints) == 0:
+                with counter_lock:
+                    no_datapoints_counter[metric['Namespace']] += 1
+                    total_no_datapoints += 1
 
-        if not datapoints or len(datapoints) == 0:
-            logger.info(
-                f"No datapoints found for namespace {metric['Namespace']} and metric '{metric['MetricName']}' in account {account.account_id}"
-            )
-        if datapoints:
+                
+                #logger.info(
+                #    f"No datapoints found for namespace {metric['Namespace']} and metric '{metric['MetricName']}' in account {account.account_id}"
+                #)
+            if datapoints:
 
-            for datapoint in datapoints:
+                for datapoint in datapoints:
 
-                timestamp_utc = datapoint.get("Timestamp")
-                if timestamp_utc and (
-                    timestamp_utc.tzinfo is None
-                    or timestamp_utc.tzinfo.utcoffset(timestamp_utc) is None
-                ):
-                    timestamp_utc = timestamp_utc.replace(tzinfo=timezone.utc)
-                datapoint["Timestamp"] = timestamp_utc.isoformat()
+                    timestamp_utc = datapoint.get("Timestamp")
+                    if timestamp_utc and (
+                        timestamp_utc.tzinfo is None
+                        or timestamp_utc.tzinfo.utcoffset(timestamp_utc) is None
+                    ):
+                        timestamp_utc = timestamp_utc.replace(tzinfo=timezone.utc)
+                    datapoint["Timestamp"] = timestamp_utc.isoformat()
 
-                document = create_document(response, datapoint, account.account_id)
-                es_documents_dict.append(document)
-                """ try:
-                    es.index(
-                        index=f"metrics-test-aws-{account.account_id}", document=document
-                    )
-                # TODO: crear exception por error en indexación de datos
-                except Exception as error:
-                    logger.error(
-                        f"Error processing data. No se pudo cargar account {account.account_id}: Namespace {metric['Namespace']} - metric {metric['MetricName']}"
-                    )
-                    logger.error(error) """
+                    document = create_document(response, datapoint, account.account_id)
+                    consolidate_es_documents.append(document)
+        
+        try:
+            account_session = assume_role(settings.BUCKET_MONITORING_ACCOUNT, organization_session)
+            s3_client = create_aws_client(account_session, "s3")
+        except Exception as e:
+            logger.error(f"Error creating S3 client: {e}")
+            
+        save_metrics_to_s3(s3_client, consolidated_metrics, account, interval.start_date)
+        logger.debug(f"Saving {len(consolidated_metrics)} metrics to S3")
 
-    return consolidated_metrics, es_documents_dict
+        index_to_elasticsearch(es_client, consolidate_es_documents, account.account_id, interval)
+        
+        logger.info(f"------ Metrics Summary without Datapoints for account {account.account_id} ------")
+        logger.info(f"Total metrics without datapoints: {total_no_datapoints}")
+        for namespace, count in no_datapoints_counter.items():
+            logger.info(f"{namespace}: {count} metrics")
+
+
+    except AwsExpiredTokenException as error:
+        logger.warning("Reinitiating session due to expired token")
+        organization_session = get_organization_session()
+        account_session = assume_role(account.account_id, organization_session)
+        cloudwatch_client = create_aws_client(account_session, "cloudwatch")
+        
+        for metric in metrics:
+            
+            response = get_metrics_data(cloudwatch_client, metric, interval)
+            
+                
+            if not response:
+                logger.warning(
+                    f"No response found for namespace {metric['Namespace']} and metric '{metric['MetricName']}' in account {account.account_id}"
+                )
+
+            response["Dimensions"] = metric.get("Dimensions", [])
+            response["Namespace"] = metric["Namespace"][4:]
+            response["Project"] = account.project_name
+            response["Environment"] = account.project_environment
+
+            consolidated_metrics.append(response)
+
+            datapoints = response.get("Datapoints", [])
+
+            if not datapoints or len(datapoints) == 0:
+                with counter_lock:
+                    no_datapoints_counter[metric['Namespace']] += 1
+                #logger.info(
+                #    f"No datapoints found for namespace {metric['Namespace']} and metric '{metric['MetricName']}' in account {account.account_id}"
+                #)
+            if datapoints:
+
+                for datapoint in datapoints:
+
+                    timestamp_utc = datapoint.get("Timestamp")
+                    if timestamp_utc and (
+                        timestamp_utc.tzinfo is None
+                        or timestamp_utc.tzinfo.utcoffset(timestamp_utc) is None
+                    ):
+                        timestamp_utc = timestamp_utc.replace(tzinfo=timezone.utc)
+                    datapoint["Timestamp"] = timestamp_utc.isoformat()
+
+                    document = create_document(response, datapoint, account.account_id)
+                    consolidate_es_documents.append(document)
+        
+        try:
+            account_session = assume_role(settings.BUCKET_MONITORING_ACCOUNT, organization_session)
+            s3_client = create_aws_client(account_session, "s3")
+        except Exception as e:
+            logger.error(f"Error creating S3 client: {e}")
+            
+        save_metrics_to_s3(s3_client, consolidated_metrics, account, interval.start_date)
+        logger.debug(f"Saving {len(consolidated_metrics)} metrics to S3")
+
+        index_to_elasticsearch(es_client, consolidate_es_documents, account.account_id, interval)
+        
+    
+    """ try:
+        es.index(
+            index=f"metrics-test-aws-{account.account_id}", document=document
+        )
+    # TODO: crear exception por error en indexación de datos
+    except Exception as error:
+        logger.error(
+            f"Error processing data. No se pudo cargar account {account.account_id}: Namespace {metric['Namespace']} - metric {metric['MetricName']}"
+        )
+        logger.error(error) """
+
+    return consolidated_metrics, consolidate_es_documents
+
+
+
+def index_to_elasticsearch(es_client: Elasticsearch, documents, account_id: str, interval: TimeIntervalModel):
+    index_name = f"metrics-testing-{account_id}"
+    if not documents:
+        logger.info(f"No documents to index for account {account_id} in interval {interval.start_date} - {interval.end_date}.")
+        return
+    
+    actions = [
+        {
+            "_op_type": "create",
+            "_index": index_name,
+            "_source": document
+        }
+        for document in documents
+    ]
+    
+    failed_documents = []
+    failed_documents_details = []
+    
+    try:
+        success, failed = helpers.bulk(es_client, actions, raise_on_error=False, stats_only=False)
+        logger.info(f"Successfully indexed {success} documents for account {account_id} in interval {interval.start_date} - {interval.end_date}.")
+        
+        for error in failed:
+            action = error['index']
+            status = error['status']
+            error_reason = error['error']['reason']
+            failed_doc = action.get('_source')
+            
+            if failed_doc:
+                failed_documents.append(failed_doc)
+                failed_documents_details.append({
+                    "document": failed_doc,
+                    "status": status,
+                    "error": error_reason
+                })
+        
+        if failed_documents:
+            logger.warning(f"{len(failed_documents)} documents failed to index for account {account_id} in interval {interval.start_date} - {interval.end_date}. Retrying...")
+            
+            # Guardar detalles de los documentos fallidos
+            error_log_path = os.path.join(tempfile.gettempdir(), f"failed_documents_{account_id}_{interval.start_date.strftime('%Y%m%d_%H%M%S')}.json")
+            with open(error_log_path, 'w') as f:
+                json.dump(failed_documents_details, f, indent=4)
+            logger.info(f"Failed documents details saved at {error_log_path}.")
+            
+            # Reintentar indexación
+            retry_actions = [
+                {
+                    "_op_type": "create",
+                    "_index": index_name,
+                    "_source": doc
+                }
+                for doc in failed_documents
+            ]
+            
+            retry_failed_documents = []
+            retry_failed_documents_details = []
+            
+            retry_success, retry_failures = helpers.bulk(es_client, retry_actions, raise_on_error=False, stats_only=False)
+            logger.info(f"Successfully retried and indexed {retry_success} documents for account {account_id} in interval {interval.start_date} - {interval.end_date}.")
+            
+            for error in retry_failures:
+                action = error['index']
+                status = error['status']
+                error_reason = error['error']['reason']
+                failed_doc = action.get('_source')
+                
+                if failed_doc:
+                    retry_failed_documents.append(failed_doc)
+                    retry_failed_documents_details.append({
+                        "document": failed_doc,
+                        "status": status,
+                        "error": error_reason
+                    })
+            
+            if retry_failed_documents:
+                logger.error(f"{len(retry_failed_documents)} documents failed to index even after retry for account {account_id} in interval {interval.start_date} - {interval.end_date}.")
+                # Guardar detalles de los documentos que fallaron después del reintento
+                final_error_log_path = os.path.join(tempfile.gettempdir(), f"final_failed_documents_{account_id}_{interval.start_date.strftime('%Y%m%d_%H%M%S')}.json")
+                with open(final_error_log_path, 'w') as f:
+                    json.dump(retry_failed_documents_details, f, indent=4)
+                logger.info(f"Final failed documents details saved at {final_error_log_path}.")
+    
+    except Exception as e:
+        logger.error(f"Error during bulk indexing for account {account_id} in interval {interval.start_date} - {interval.end_date}: {e}")
+
+
 
 
 def calculate_time_interval(
@@ -624,6 +812,11 @@ def get_metrics_data(
 
     except AttributeError as error:
         logger.error("An attribute error occurred while get metric data: %s", error)
+    except ClientError as e:
+        if e.response['Error']['Code'] == 'ExpiredToken':
+            logger.warning(f" {e.response['Error']['Code']}: Session has expired get metric data")
+            raise AwsExpiredTokenException("Session has expired")
+        raise AwsClientErrorException("Failed to get metric data: %s" % e)
     except Exception as error:
         logger.error(
             "Couldn't get metric data %s of namespace %s: %s",
@@ -688,19 +881,20 @@ def save_metrics_to_s3(
     s3_client: boto3.client, metrics: List, account: AccountModel, timestamp: datetime
 ) -> None:
 
-    logger.debug("Saving metrics to S3")
     try:
         timestamp_str = timestamp.strftime(
             "%Y%m%d_%H%M%S"
         )
         s3_key = f"{account.project_environment}_{timestamp_str}.parquet.gzip"
+        s3_filename = f"metrics/{account.project_environment}_{timestamp_str}.parquet.gzip"
 
         df = pl.DataFrame(metrics)
         df.write_parquet(s3_key, compression="gzip")
-        s3_client.upload_file(s3_key, account.bucket_name, s3_key)
+        s3_client.upload_file(s3_key, account.bucket_name, s3_filename)
+        logger.debug(f"Saving metrics to S3 at '{s3_key}' for account {account.account_id} ...")
 
     except Exception as e:
-        logger.error(f"Error saving metrics to S3: {e}")
+        logger.error(f"Error saving metrics to S3 for account {account.account_id}: {e}")
         #TODO: exception nombre repetido de archivo
         raise
 
@@ -787,7 +981,7 @@ def validate_metrics_collection_periods(
         return 60
 
 
-def collect_metrics(
+def collect_metrics_test(
     accounts: List[AccountModel],
     org_session: boto3.Session,
     es_client: Elasticsearch,
@@ -804,6 +998,7 @@ def collect_metrics(
         save_metrics_to_s3(s3_client, consolidated_metrics, account, end_time) """
 
     for account in accounts:
+        logger.debug(f"Starting to collect metrics for account {account.project_name}.")
         account_id = account.account_id
         start_date = (
             (end_date - timedelta(minutes=account.collection_interval))
@@ -831,13 +1026,15 @@ def collect_metrics(
 
             with ThreadPoolExecutor(max_workers=settings.MAX_THREADS) as executor:
                 futures = [
-                    executor.submit(
-                        fetch_metrics_for_interval,
-                        cloudwatch_client,
-                        metrics,
-                        account,
-                        interval
-                    )
+                        executor.submit(
+                            process_interval,
+                            org_session,
+                            cloudwatch_client,
+                            es_client,
+                            metrics,
+                            account,
+                            interval
+                        )
                     for interval in intervals
                 ]
 
@@ -912,6 +1109,193 @@ def collect_metrics(
 
     # metrics_data = fetch_metrics(account_id, service_name)
     # save_metrics_to_s3(metrics_data, account_id, service_name)
+
+
+
+def collect_metrics(
+    accounts: List[AccountModel],
+    org_session: boto3.Session,
+    es_client: Elasticsearch,
+    start_time: datetime,
+    end_date: datetime,
+) -> None:
+
+    with ThreadPoolExecutor(max_workers=settings.MAX_THREADS) as executor:
+        futures = []
+
+        for account in accounts:
+            account_id = account.account_id
+            start_date = (
+                (end_date - timedelta(minutes=account.collection_interval))
+                if start_time == None
+                else start_time
+            )
+
+            try:
+                validate_dates(start_date, end_date)
+                account_session = assume_role(account_id, org_session)
+                cloudwatch_client = create_aws_client(account_session, "cloudwatch")
+                intervals = split_time_range(
+                start_date, end_date, account.metrics_collection_period
+                )
+                
+                metrics = get_all_cloudwatch_metrics(cloudwatch_client)
+                logger.debug(f"Account {account_id} has {len(intervals)} intervals and {len(metrics)} metrics found")
+
+            except DateValidationException as error:
+                logger.error(error)
+            except AwsClientErrorException as error:
+                logger.error(error)
+            except PeriodException as error:
+                logger.error(error)
+            except AwsCollectMetricsException as error:
+                logger.error(error)
+            
+
+            for interval in intervals:
+                futures.append(
+                    executor.submit(
+                        process_interval,
+                        org_session,
+                        cloudwatch_client,
+                        es_client,
+                        metrics,
+                        account,
+                        interval
+                    )
+                )
+
+        for future in as_completed(futures):
+            try:
+                future.result()
+            except ClientError as e:
+                if e.response['Error']['Code'] == 'ExpiredToken':
+                    logger.warning("Token expired. Re-authenticating.", e)
+                #logging.warning("Token expirado durante el procesamiento. Reintentando con una nueva sesión.")
+                # Implementar lógica para reintentar con una nueva sesión si es necesario
+                # Esto podría incluir re-asumir el rol y volver a procesar el intervalo
+            except Exception as e:
+                logger.error(f"Error processing a future: {e}")
+
+
+def collect_metrics_old(
+    accounts: List[AccountModel],
+    org_session: boto3.Session,
+    es_client: Elasticsearch,
+    start_time: datetime,
+    end_date: datetime,
+) -> None:
+        all_consolidated_metrics = []
+        all_es_documents = []
+        
+        for account in accounts:
+            logger.debug(f"Starting to collect metrics for account {account.project_name}.")
+            account_id = account.account_id
+            start_date = (
+                (end_date - timedelta(minutes=account.collection_interval))
+                if start_time == None
+                else start_time
+            )
+
+            try:
+                validate_dates(start_date, end_date)
+                account_session = assume_role(account_id, org_session)
+                cloudwatch_client = create_aws_client(account_session, "cloudwatch")
+                intervals = split_time_range(
+                    start_date, end_date, account.metrics_collection_period
+                )
+                logger.debug(f"Total intervals to process: {len(intervals)}")
+
+                metrics = get_all_cloudwatch_metrics(cloudwatch_client)
+                logger.debug(f"Found {len(metrics)} metrics")
+            except DateValidationException as error:
+                logger.error(error)
+            except AwsClientErrorException as error:
+                logger.error(error)
+            except PeriodException as error:
+                logger.error(error)
+            except AwsCollectMetricsException as error:
+                logger.error(error)
+
+
+
+            try:
+                intervals = split_time_range(
+                    start_date, end_date, account.metrics_collection_period
+                )
+                logger.debug(f"Total intervals to process: {len(intervals)}")
+
+                metrics = get_all_cloudwatch_metrics(cloudwatch_client)
+                logger.debug(f"Found {len(metrics)} metrics")
+
+                with ThreadPoolExecutor(max_workers=settings.MAX_THREADS) as executor:
+                    futures = [
+                        executor.submit(
+                            process_interval,
+                            cloudwatch_client,
+                            es_client,
+                            metrics,
+                            account,
+                            interval
+                        )
+                        for interval in intervals
+                    ]
+
+                    for future in as_completed(futures):
+                        try:
+                            consolidated_metrics, es_documents = future.result()
+                            all_consolidated_metrics.extend(consolidated_metrics)
+                        
+                            if es_documents and len(es_documents) > 0:
+                                all_es_documents.extend(es_documents)
+                            else:
+                                logger.info(f"No ES documents found for account {account_id} in this interval")
+                        #TODO: Add exception handling   
+                        except Exception as e:
+                            logger.error(f"Error processing an interval for account {account_id}: {e}")
+            
+                if all_consolidated_metrics and len(all_consolidated_metrics) > 0:
+                    try:
+                        account_session = assume_role(settings.BUCKET_MONITORING_ACCOUNT, org_session)
+                        s3_client = create_aws_client(account_session, "s3")
+                        save_metrics_to_s3(s3_client, all_consolidated_metrics, account, start_date)
+                        logger.debug(f"Saving {len(all_consolidated_metrics)} metrics to S3")
+
+                    except AwsClientErrorException as error:
+                        logger.error(error)
+
+                index_name = f"metrics-testing-{account_id}"
+                #if all_es_documents and len(all_es_documents) > 0:
+
+                actions = [
+                    {
+                        "_op_type": "create",
+                        "_index": index_name,
+                        "_source": document
+                    }
+                    for document in all_es_documents
+                ]
+
+                try:
+                    success, failed = helpers.bulk(es_client, actions, raise_on_error=False)
+
+                    print(f"Documentos indexados con éxito: {success}")
+                    print(f"Documentos que fallaron al indexar: {len(failed)}")
+
+                    # Imprimir los errores de los documentos que fallaron
+                    for error in failed:
+                        print(f"Error: {error}")
+                except Exception as e:
+                    print(f"Error al indexar documentos: {e}")
+                    #logger.info(f"Saved {len(all_es_documents)} documents for account {account_id}")
+                    #except Exception as e:
+                    #    logger.error(f"Error saving documents to ES: {e}")
+
+            except PeriodException as error:
+                logger.error(error)
+            except AwsCollectMetricsException as error:
+                logger.error(error)
+
 
 
 def fetch_metrics(session, service_name):
@@ -996,7 +1380,7 @@ if __name__ == "__main__":
     try:
         collect_metrics(accounts, session, es_client, start_time, end_date)
     except Exception as error:
-        logger.critical(error)
+        logger.error(error)
     end_process_time = time.time()
 
     collect_metrics_time = end_process_time - start_collect_metrics
