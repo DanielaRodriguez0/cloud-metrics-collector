@@ -4,6 +4,8 @@ import boto3
 import time
 import argparse
 import polars as pl
+import random
+import string
 #import pandas as pd
 import tempfile
 import sys
@@ -596,6 +598,33 @@ def process_interval(
 
             datapoints = response.get("Datapoints", [])
 
+            #TODO: agregar validación si el responsemedatada es =! 200
+            """ {
+                "Label":"Aurora_pq_request_not_chosen_below_min_rows",
+                "Datapoints":[],
+                "ResponseMetadata":{
+                    "RequestId":"67s6df78-8cb2cd1bdf7a",
+                    "HTTPStatusCode":200,
+                    "HTTPHeaders":{
+                        "x-amzn-requestid":"67s6df78-8cb2cd1bdf7a",
+                        "content-type":"text/xml",
+                        "content-length":"366",
+                        "date":"Sun, 29 Sep 2024 04:27:01 GMT",
+                        "connection":null
+                    },
+                    "RetryAttempts":0
+                },
+                "Dimensions":[
+                    {
+                        "Name":"DatabaseClass",
+                        "Value":"db.r6g.2xlarge"
+                    }
+                ],
+                "Namespace":"RDS",
+                "Project":"ESC",
+                "Environment":"production"
+            } """
+
             if not datapoints or len(datapoints) == 0:
                 with counter_lock:
                     no_datapoints_counter[metric['Namespace']] += 1
@@ -663,8 +692,8 @@ def index_to_elasticsearch(es_client: Elasticsearch, documents, account_id: str,
     failed_documents_details = []
     
     try:
-        success, failed = helpers.bulk(es_client, actions, raise_on_error=False, stats_only=False)
-        logger.info(f"Successfully indexed {success} documents for account {account_id} in interval {interval.start_date} - {interval.end_date}.")
+        success, failed = helpers.bulk(es_client, actions, raise_on_error=False, stats_only=False, chunk_size=5000,max_retries=3)
+        logger.debug(f"Successfully indexed {success} documents for account {account_id} in interval {interval.start_date} - {interval.end_date}.")
         
         for error in failed:
             action = error['index']
@@ -702,7 +731,7 @@ def index_to_elasticsearch(es_client: Elasticsearch, documents, account_id: str,
             retry_failed_documents = []
             retry_failed_documents_details = []
             
-            retry_success, retry_failures = helpers.bulk(es_client, retry_actions, raise_on_error=False, stats_only=False)
+            retry_success, retry_failures = helpers.bulk(es_client, retry_actions, raise_on_error=False, stats_only=False, chunk_size=5000, max_retries=3)
             logger.info(f"Successfully retried and indexed {retry_success} documents for account {account_id} in interval {interval.start_date} - {interval.end_date}.")
             
             for error in retry_failures:
@@ -885,8 +914,9 @@ def save_metrics_to_s3(
         timestamp_str = timestamp.strftime(
             "%Y%m%d_%H%M%S"
         )
-        s3_key = f"{account.project_environment}_{timestamp_str}.parquet.gzip"
-        s3_filename = f"metrics/{account.project_environment}_{timestamp_str}.parquet.gzip"
+        random_str = ''.join(random.choices(string.ascii_letters + string.digits, k=settings.random_s3_name_length))
+        s3_key = f"{account.project_environment}_{timestamp_str}_{random_str}.parquet.gzip"
+        s3_filename = f"metrics/{account.project_environment}_{timestamp_str}_{random_str}.parquet.gzip"
 
         df = pl.DataFrame(metrics)
         df.write_parquet(s3_key, compression="gzip")
@@ -1133,11 +1163,16 @@ def collect_metrics(
 
             try:
                 validate_dates(start_date, end_date)
-                account_session = assume_role(account_id, org_session)
-                cloudwatch_client = create_aws_client(account_session, "cloudwatch")
+                #account_session = assume_role(account_id, org_session)
+                #cloudwatch_client = create_aws_client(account_session, "cloudwatch")
                 intervals = split_time_range(
                 start_date, end_date, account.metrics_collection_period
                 )
+
+                print('Hola')
+                for i in intervals:
+                    print(i)
+                break
                 
                 metrics = get_all_cloudwatch_metrics(cloudwatch_client)
                 logger.debug(f"Account {account_id} has {len(intervals)} intervals and {len(metrics)} metrics found")
@@ -1277,7 +1312,7 @@ def collect_metrics_old(
                 ]
 
                 try:
-                    success, failed = helpers.bulk(es_client, actions, raise_on_error=False)
+                    success, failed = helpers.bulk(es_client, actions, raise_on_error=False, chunk_size=5000, max_retries=3)
 
                     print(f"Documentos indexados con éxito: {success}")
                     print(f"Documentos que fallaron al indexar: {len(failed)}")

@@ -17,6 +17,7 @@ class Settings(BaseSettings):
     ELASTICSEARCH_PASSWORD: str
     MAX_THREADS: int = 5
     BUCKET_MONITORING_ACCOUNT: str
+    RANDOM_S3_NAME_LENGTH: int = 6
     #TODO: LOG_LEVEL: str = 'DEBUG'
 
 settings = Settings()
