@@ -1,0 +1,40 @@
+{
+    "cloudwatch_limits": {
+        "MAX_DATAPOINTS": 1440,
+        "MAX_METRICS": 500,
+        "3_HOURS": 10800,
+        "15_DAYS": 1296000,
+        "63_DAYS": 5443200,
+        "455_DAYS": 39312000
+    },
+    "retention_period_mapping": {
+        "1": 1296000,
+        "5": 5443200,
+        "10": 5443200,
+        "30": 5443200,
+        "60": 39312000
+    },      
+    "allowed_periods": [1, 5, 10, 30, 60],
+    "default_periods": {
+        "production": 1,
+        "pre-production": 60,
+        "staging": 120,
+        "development": 120,
+        "test": 120
+    },
+    "statistics":["Minimum", "Average", "Maximum", "Sum", "SampleCount"],
+    "environment_variables": {
+        "start_time": {
+            "args_variable": "start_time",
+            "type": "parse_date_time",
+            "default": "",
+            "help": "Start time in format 'YYYY-MM-DDTHH:MM:SSZ'"
+        },
+        "end_time": {
+            "args_variable": "end_time",
+            "type": "parse_date_time",
+            "default": "datetime.strptime(datetime.now().strftime('%Y-%m-%dT%H:%M:%SZ'), '%Y-%m-%dT%H:%M:%SZ')",
+            "help": "End time in format 'YYYY-MM-DDTHH:MM:SSZ'"
+        }
+    }
+}

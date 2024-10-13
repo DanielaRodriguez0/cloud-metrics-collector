@@ -1,0 +1,9 @@
+server.name: kibana06
+server.host: 0.0.0.0
+elasticsearch.hosts: ["http://elasticsearch06:9200"]
+#elasticsearch.username: "elasticuser"
+elasticsearch.username: elastic
+elasticsearch.password: Changeme123
+xpack.encryptedSavedObjects.encryptionKey: "ab7n8H8g7n8H8gqf8Qwvq5LZ0xP9xQ=="
+xpack.security.enabled: true
+xpack.security.encryptionKey: "ab7n8H8g7n8H8gqf8Qwvq5LZ0xP9xQ=="

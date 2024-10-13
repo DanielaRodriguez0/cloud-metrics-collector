@@ -1,0 +1,20 @@
+{
+    "accounts": [
+        {
+            "account_id": "493149128450",
+            "project_name": "Sandbox",
+            "project_environment": "development",
+            "bucket_name": "logs-test-monitoring",
+            "collection_interval": 10,
+            "metrics_collection_period": 5
+        },
+        {
+            "account_id": "591612375048",
+            "project_name": "Siriux",
+            "project_environment": "production",
+            "bucket_name": "logs-test-monitoring",
+            "collection_interval": 10,
+            "metrics_collection_period": 5
+        }
+    ]
+}

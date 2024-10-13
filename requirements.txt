@@ -1,0 +1,5 @@
+colorama==0.4.6
+colorlog==6.8.2
+pydantic-settings==2.5.2
+boto3==1.35.21
+elasticsearch==8.15.1
