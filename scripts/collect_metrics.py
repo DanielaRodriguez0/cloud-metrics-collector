@@ -899,7 +899,7 @@ def create_document(response: dict, datapoint, account_id: str):
                     }
                 }
             },
-        },
+        },  
     }
 
     document = json.dumps(data)
